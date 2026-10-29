@@ -100,6 +100,18 @@ def _render_node(node: Any, indent: str = "") -> str:
     if node_type in ("expand", "nestedExpand"):
         title = attrs.get("title") or "Details"
         return f"**{title}**{_BLOCK_SEPARATOR}{_render_blocks(_children(node))}"
+    if node_type == "taskList":
+        return _render_task_list(node, indent)
+    if node_type == "decisionList":
+        return "\n".join(
+            f"{indent}- **Decision:** {_render_inline(_children(item))}"
+            for item in _children(node)
+            if isinstance(item, dict)
+        )
+    if node_type == "caption":
+        return f"*{_render_inline(_children(node))}*"
+    if node_type in ("extension", "inlineExtension"):
+        return _render_extension(attrs)
 
     # Unknown node type: recurse into children rather than dropping content.
     return _render_blocks(_children(node), indent)
@@ -196,9 +208,48 @@ def _render_table(node: dict[str, Any]) -> str:
 
 def _render_media(node: dict[str, Any], attrs: dict[str, Any]) -> str:
     if node.get("type") == "media":
+        if attrs.get("type") == "external" and attrs.get("url"):
+            return f"[image: {attrs['url']}]"
         name = attrs.get("alt") or attrs.get("id") or "media"
         return f"[attachment: {name}]"
     return _render_blocks(_children(node))
+
+
+def _render_task_list(node: dict[str, Any], indent: str) -> str:
+    lines: list[str] = []
+    for item in _children(node):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "taskList":
+            lines.append(_render_task_list(item, indent + "  "))
+            continue
+        done = (item.get("attrs") or {}).get("state") == "DONE"
+        text = _render_inline(_children(item))
+        lines.append(f"{indent}- [{'x' if done else ' '}] {text}")
+    return "\n".join(lines)
+
+
+def _macro_param(attrs: dict[str, Any], name: str) -> str:
+    params = (attrs.get("parameters") or {}).get("macroParams") or {}
+    value = (params.get(name) or {}).get("value")
+    return str(value) if value else ""
+
+
+def _render_extension(attrs: dict[str, Any]) -> str:
+    """Body-less macros (Confluence) render dynamically in the browser, so
+    only their identity can be shown; Jira macros keep their issue key/JQL
+    so the referenced tickets can be fetched."""
+    key = str(attrs.get("extensionKey") or "macro")
+    if key == "jira":
+        issue_key = _macro_param(attrs, "key")
+        if issue_key:
+            return f"[Jira issue: {issue_key}]"
+        jql = _macro_param(attrs, "jqlQuery")
+        if jql:
+            return f"[Jira issues: {jql}]"
+    metadata = (attrs.get("parameters") or {}).get("macroMetadata") or {}
+    title = metadata.get("title") or key
+    return f"[macro: {title}]"
 
 
 def _render_date(attrs: dict[str, Any]) -> str:

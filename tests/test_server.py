@@ -8,7 +8,7 @@ import pytest
 from jira_mcp import server
 from jira_mcp.client import JiraClient
 from jira_mcp.config import Settings
-from jira_mcp.server import _get_issue_impl
+from jira_mcp.server import _get_issue_context_impl, _get_issue_impl
 
 SITE = "https://example.atlassian.net"
 ACCOUNT = {"accountId": "abc", "displayName": "Ada"}
@@ -101,3 +101,61 @@ async def test_catalog_failure_is_retried_next_call() -> None:
     output = await _get_issue_impl(client, "PROJ-1", include_comments=False)
     assert "- **Acceptance Criteria:**" in output
     assert handler.catalog_requests == 2
+
+
+CONTEXT_ISSUE = {
+    "key": "PROJ-1",
+    "fields": {
+        "summary": "Add tags",
+        "issuetype": {"name": "Story"},
+        "status": {"name": "To Do"},
+        "subtasks": [],
+        "issuelinks": [],
+    },
+}
+
+REMOTE_LINKS = [
+    {
+        "relationship": "mentioned in",
+        "application": {"type": "com.atlassian.confluence", "name": "Confluence"},
+        "object": {
+            "url": f"{SITE}/wiki/pages/viewpage.action?pageId=4242",
+            "title": "Tagging spec",
+        },
+    },
+    {"object": {"url": "https://github.com/x/y/pull/1", "title": "PR #1"}},
+]
+
+
+def context_handler(remote_status: int) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/rest/api/3/myself":
+            return httpx.Response(200, json=ACCOUNT)
+        if path == "/rest/api/3/issue/PROJ-1":
+            return httpx.Response(200, json=CONTEXT_ISSUE)
+        if path == "/rest/api/3/issue/PROJ-1/remotelink":
+            if remote_status != 200:
+                return httpx.Response(remote_status)
+            return httpx.Response(200, json=REMOTE_LINKS)
+        return httpx.Response(404)
+
+    return handler
+
+
+async def test_context_lists_confluence_remote_links_with_page_id() -> None:
+    client = make_client(context_handler(200))
+    output = await _get_issue_context_impl(client, "PROJ-1")
+    assert "## Remote links (2)" in output
+    assert (
+        f"- mentioned in: [Tagging spec]({SITE}/wiki/pages/viewpage.action?pageId=4242)"
+        " — Confluence page id 4242 (get_confluence_page)" in output
+    )
+    assert "- [PR #1](https://github.com/x/y/pull/1)" in output
+
+
+async def test_context_survives_remote_link_failure() -> None:
+    client = make_client(context_handler(403))
+    output = await _get_issue_context_impl(client, "PROJ-1")
+    assert "## Linked issues" in output
+    assert "Remote links" not in output

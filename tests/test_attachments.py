@@ -12,8 +12,8 @@ from fastmcp.utilities.types import Image
 from jira_mcp import server
 from jira_mcp.client import JiraClient
 from jira_mcp.config import Settings
+from jira_mcp.images import MAX_ATTACHMENT_BYTES
 from jira_mcp.server import (
-    MAX_ATTACHMENT_BYTES,
     MAX_INLINE_TEXT_CHARS,
     PREVIEW_LINES,
     PREVIEW_MAX_CHARS,

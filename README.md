@@ -1,33 +1,53 @@
-# Jira MCP Server (read-only)
+# Jira & Confluence MCP Server (read-only)
 
 A local [MCP](https://modelcontextprotocol.io) server that lets Claude Code pull Jira
 ticket context (issue details, comment threads, the reference graph around a ticket,
-and JQL search results) rendered as compact Markdown. Attachments can be fetched
-too: images (e.g. the screenshot on a UI bug ticket) for Claude to analyze visually,
-and text files (logs, stack traces, JSON/HAR, CSV, source code, ...) as plain text.
+and JQL search results) and Confluence content (pages, blog posts, footer and inline
+comments, the page tree, and CQL search results), all rendered as compact Markdown.
+Image attachments from either product (the screenshot on a UI bug ticket, a diagram
+in a spec page) can be fetched for Claude to analyze visually; Jira text attachments
+(logs, stack traces, JSON/HAR, CSV, source code, ...) come back as plain text.
 
 ## What it deliberately cannot do
 
 This server is **strictly read-only**. It exposes no tool that creates, updates,
 transitions, deletes, or comments on anything. Enforcement is layered:
 
-1. **In code:** every HTTP request funnels through a single helper that only permits
-   `GET`, with one allowlisted exception: `POST /rest/api/3/search/jql`, a read
-   operation that Atlassian requires be sent as POST. Any other method raises
+1. **In code:** every HTTP request (Jira and Confluence) funnels through a single
+   helper that only permits `GET`, with one allowlisted exception:
+   `POST /rest/api/3/search/jql`, a read operation that Atlassian requires be sent as
+   POST. Confluence has no POST exception at all. Any other method raises
    `ReadOnlyViolationError`, so a future edit that adds a write call fails loudly.
 2. **At the credential level:** create the API token with only read scopes (below),
    so even a bug could not write.
 
 ## Tools
 
+### Jira
+
 | Tool | Purpose |
 |---|---|
 | `get_issue(issue_key, include_comments=True)` | Full ticket detail including all non-empty custom fields (acceptance criteria, story points, ...) with their display names, plus (by default) the comment thread |
 | `get_comments(issue_key, limit=100, newest_first=False)` | Just the discussion, with author/timestamp/edited/visibility |
-| `get_issue_context(issue_key)` | Parent, subtasks, linked issues (with link direction), and epic children, each as key + type + status + summary |
+| `get_issue_context(issue_key)` | Parent, subtasks, linked issues (with link direction), epic children, and remote links. Linked Confluence pages are shown with their page ID, ready for `get_confluence_page` |
 | `search_issues(jql, limit=25)` | Compact JQL search results |
 | `get_attachment(attachment_id)` | Downloads an attachment (listed by `get_issue`). Images (png/jpeg/gif/webp) come back as vision input, so Claude can look at screenshots; text files (detected by mime type, or by extension when Jira reports `application/octet-stream`) come back as text. Files of unknown type and extension (e.g. `Dockerfile`, `app.log.1`) are downloaded and served as text if their content has no NUL bytes and is valid UTF-8 (or UTF-16 with BOM). Text over 20,000 characters is saved in full (as UTF-8) under `<tmp>/jira-mcp/attachments/`, and the tool returns that path plus the first and last 50 lines, so Claude can grep or page through the file instead of loading it all. Max 5 MB; videos, PDFs, archives and other binary files are rejected |
-| `whoami()` | Which account the token resolves to; the first stop for auth debugging |
+
+### Confluence
+
+| Tool | Purpose |
+|---|---|
+| `get_confluence_page(page, include_comments=True)` | A page or blog post (by numeric ID or URL): space, version, author/owner, labels, URL, the full body (tables, task lists, macros; embedded Jira issues shown as `[Jira issue: KEY]`; embedded images labelled with their attachment ID), the attachment list, and (by default) all footer + inline comments with reply threads |
+| `get_confluence_comments(page, limit=100)` | Just the discussion: footer comments, then inline comments (quoting the highlighted text, marked if resolved), replies nested |
+| `get_confluence_page_context(page)` | Where the page sits in the tree: ancestors (top-level first) and direct children, each with title + ID |
+| `search_confluence(query, limit=25)` | Plain words run a full-text search over pages and blog posts; anything with CQL syntax (`space = ENG AND title ~ "auth"`) is sent as CQL |
+| `get_confluence_attachment(attachment_id)` | Downloads an image attachment (`att…` ID from `get_confluence_page`) as vision input. Same limits as Jira: png/jpeg/gif/webp, max 5 MB |
+
+### Both
+
+| Tool | Purpose |
+|---|---|
+| `whoami()` | Which account each product's token resolves to (Jira and Confluence reported separately); the first stop for auth debugging |
 
 ## Setup
 
@@ -40,7 +60,26 @@ transitions, deletes, or comments on anything. Enforcement is layered:
    - `read:jira-user`
 4. Copy the token immediately; it is shown only once.
 
-An older *unscoped* token also works; the server handles both automatically (see below).
+An older *unscoped* token also works for **both** Jira and Confluence; the server
+handles both kinds automatically (see below).
+
+#### Confluence token scopes
+
+A scoped token is bound to **one** app, so with scoped tokens Confluence needs a
+second token: repeat the steps above, select the **Confluence** app, and put that
+token in `CONFLUENCE_API_TOKEN`. Select only read scopes:
+
+- `read:page:confluence`, `read:blogpost:confluence`: page and blog post bodies
+- `read:comment:confluence`: footer and inline comments
+- `read:attachment:confluence`: attachment lists and image downloads
+- `read:space:confluence`: space names
+- `read:label:confluence`: page labels
+- `read:hierarchical-content:confluence`: ancestors and children
+- `read:user:confluence`: author names and the auth probe
+- `search:confluence`: CQL search (if search returns 403, also add
+  `read:content-details:confluence`)
+
+If you use one unscoped token, leave `CONFLUENCE_API_TOKEN` unset.
 
 ### 2. Configure `.env`
 
@@ -54,7 +93,8 @@ Required keys (this is the whole configuration surface):
 |---|---|
 | `ATLASSIAN_EMAIL` | The email of your Atlassian account |
 | `ATLASSIAN_API_TOKEN` | The token from step 1 |
-| `ATLASSIAN_SITE_URL` | e.g. `https://your-company.atlassian.net` |
+| `ATLASSIAN_SITE_URL` | e.g. `https://your-company.atlassian.net` (shared by Jira and Confluence) |
+| `CONFLUENCE_API_TOKEN` | *Optional.* A separate Confluence token (needed for scoped tokens; see above). Falls back to `ATLASSIAN_API_TOKEN` |
 
 `.env` is gitignored; never commit it. Real environment variables take precedence
 over the file. The file is located relative to the project directory (not the working
@@ -80,23 +120,28 @@ python -m venv .venv
 ```bash
 .venv/bin/python -m jira_mcp --check            # connectivity + auth only
 .venv/bin/python -m jira_mcp --check PROJ-123   # also fetch a ticket in full
+.venv/bin/python -m jira_mcp --check --page 123456   # also fetch a Confluence page
 ```
 
-This prints whether `.env` was found, which base URL was selected (and whether the
-cloud-ID fallback was needed), the authenticated account, and, when a key is given,
-the ticket exactly as Claude would see it.
+This prints whether `.env` was found, which base URL was selected for each product
+(and whether the cloud-ID fallback was needed), the authenticated account, and, when
+a key or page is given, the content exactly as Claude would see it. `--page` accepts a
+numeric page ID or a full page URL.
 
 ## Scoped vs. unscoped tokens: the base URL problem
 
 - An **unscoped** token works against your site URL, `https://<site>.atlassian.net`.
 - A **scoped** token against that same URL fails *silently*, returning
   anonymous-looking responses. It must call
-  `https://api.atlassian.com/ex/jira/{cloudId}` instead.
+  `https://api.atlassian.com/ex/jira/{cloudId}` (or `/ex/confluence/{cloudId}` for
+  Confluence) instead.
 
-You do not need to know which kind you hold. At startup the server probes the site URL
-with `GET /rest/api/3/myself`; if that does not return a real account, it fetches your
+You do not need to know which kind you hold. On first use the server probes the site
+URL with `GET /rest/api/3/myself` (Confluence: `GET /wiki/rest/api/user/current`); if that does not return a real account, it fetches your
 cloud ID from `{site}/_edge/tenant_info` and retries against `api.atlassian.com`. The
-winner is cached for the process lifetime and logged to stderr.
+winner is cached for the process lifetime and logged to stderr. Jira and Confluence
+are detected independently, so one can use an unscoped token and the other a scoped
+one.
 
 If detection ever fails: `_edge/tenant_info` is not part of Atlassian's formally
 supported REST API (though Atlassian's own support docs point at it), so it could
@@ -145,7 +190,7 @@ Notes:
 
 Inside a Claude Code session:
 
-- Run `/mcp`; the `jira` server should be listed as connected, with six tools.
+- Run `/mcp`; the `jira` server should be listed as connected, with eleven tools.
 - Or just ask: *"use whoami to check the jira connection"*.
 
 ## Troubleshooting
@@ -154,8 +199,10 @@ Inside a Claude Code session:
 |---|---|
 | **401 Unauthorized** | Wrong email or token, or the token was revoked/expired. Recreate the token and update `.env`. Run `--check` to confirm. |
 | **403 Forbidden** | Scoped token missing `read:jira-work` / `read:jira-user`, or your account lacks site access. Recreate the token with both read scopes. |
-| **404 Not Found** | The issue doesn't exist, **or your account lacks permission to see it**. Jira reports issues you cannot view as 404, and a token never grants more access than the human it belongs to. Verify you can open the ticket in a browser while logged in as that account. |
+| **Confluence 401/403 but Jira works** | With scoped tokens, the Jira token cannot read Confluence. Create a Confluence-scoped token and set `CONFLUENCE_API_TOKEN`. `whoami` shows each product's status separately. |
+| **404 Not Found** | The issue or page doesn't exist, **or your account lacks permission to see it**. Jira reports issues you cannot view as 404, and a token never grants more access than the human it belongs to. Verify you can open the ticket in a browser while logged in as that account. |
 | **Empty tool list in Claude** | The server crashed at startup. Run the exact command from `claude mcp add` yourself in a terminal; startup errors print to stderr. Usual causes: wrong Python path, or missing `.env` keys. |
+| **"short link" error for a Confluence URL** | `/wiki/x/…` short links can't be resolved without a browser. Open the link and pass the full page URL (or the numeric ID from it). |
 | **Server won't start** | Run `--check`. If it reports missing config, fix `.env`. If imports fail, re-run `uv sync` (or reinstall `requirements.txt`) and confirm the venv Python is ≥ 3.11. |
 | **Detection failed / anonymous responses** | Startup logs (stderr) say which base URL was probed and why it was rejected. If `_edge/tenant_info` is unreachable, set `ATLASSIAN_CLOUD_ID` in `.env`. |
 

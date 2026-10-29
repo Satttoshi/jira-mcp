@@ -6,9 +6,9 @@ import httpx
 import pytest
 
 from jira_mcp.client import (
+    AtlassianError,
     BaseUrlDetectionError,
     JiraClient,
-    JiraError,
     ReadOnlyViolationError,
 )
 from jira_mcp.config import Settings
@@ -177,5 +177,5 @@ async def test_404_error_mentions_permissions() -> None:
         return httpx.Response(404)
 
     client = make_client(handler)
-    with pytest.raises(JiraError, match="permission"):
+    with pytest.raises(AtlassianError, match="permission"):
         await client.get_json("/rest/api/3/issue/NOPE-1")

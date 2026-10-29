@@ -33,6 +33,12 @@ class Settings:
     site_url: str
     cloud_id: str | None
     env_file_found: bool
+    # Scoped tokens are bound to one app, so Confluence may need its own token.
+    confluence_api_token: str | None = None
+
+    @property
+    def confluence_token(self) -> str:
+        return self.confluence_api_token or self.api_token
 
 
 def _normalize_site_url(raw: str) -> str:
@@ -62,4 +68,5 @@ def load_settings() -> Settings:
         site_url=_normalize_site_url(os.environ["ATLASSIAN_SITE_URL"]),
         cloud_id=os.environ.get("ATLASSIAN_CLOUD_ID", "").strip() or None,
         env_file_found=env_file_found,
+        confluence_api_token=os.environ.get("CONFLUENCE_API_TOKEN", "").strip() or None,
     )

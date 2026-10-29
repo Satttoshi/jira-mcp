@@ -21,8 +21,17 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.utilities.types import Image
 
-from .client import MYSELF_PATH, JiraClient, JiraError
+from . import confluence
+from .client import (
+    MYSELF_PATH,
+    AtlassianClient,
+    AtlassianError,
+    ConfluenceClient,
+    JiraClient,
+)
 from .config import ENV_FILE, ConfigError, Settings, load_settings
+from .confluence_render import render_remote_links
+from .images import IMAGE_FORMATS, MAX_ATTACHMENT_BYTES
 from .render import (
     format_size,
     is_text_attachment,
@@ -38,32 +47,43 @@ from .render import (
 logger = logging.getLogger(__name__)
 
 mcp: FastMCP = FastMCP(
-    name="Jira (read-only)",
+    name="Jira & Confluence (read-only)",
     instructions=(
-        "Read-only access to Jira Cloud issues.\n"
+        "Read-only access to Jira Cloud issues and Confluence Cloud pages.\n"
         "\n"
-        "When to use: whenever a Jira issue key appears in the conversation. "
-        "A key is an uppercase project prefix, a hyphen, and a number (e.g. "
-        "ABC-123, PLAT-4567); keys also show up inside branch names, commit "
-        "messages, and Jira URLs. On seeing one, fetch the ticket instead of "
-        "guessing what it contains.\n"
+        "Jira — when to use: whenever a Jira issue key appears in the "
+        "conversation. A key is an uppercase project prefix, a hyphen, and a "
+        "number (e.g. ABC-123, PLAT-4567); keys also show up inside branch "
+        "names, commit messages, and Jira URLs. On seeing one, fetch the "
+        "ticket instead of guessing what it contains.\n"
         "\n"
-        "Workflow: start with get_issue for the full ticket, then "
-        "get_issue_context to find parents, subtasks, and linked issues worth "
-        "reading. Use search_issues (JQL) when no key is given. When a ticket "
-        "lists attachments relevant to the task (e.g. a screenshot on a UI "
-        "bug, or a log, JSON payload, or CSV export), fetch them with "
-        "get_attachment to read them. Call whoami only to debug "
-        "authentication.\n"
+        "Jira workflow: start with get_issue for the full ticket, then "
+        "get_issue_context to find parents, subtasks, linked issues, and "
+        "linked Confluence pages worth reading. Use search_issues (JQL) when "
+        "no key is given. When a ticket lists attachments relevant to the "
+        "task (e.g. a screenshot on a UI bug, or a log, JSON payload, or CSV "
+        "export), fetch them with get_attachment to read them.\n"
         "\n"
-        "Constraints: strictly read-only; issues cannot be created, edited, "
-        "or transitioned."
+        "Confluence — when to use: whenever a Confluence URL (…/wiki/spaces/"
+        "…/pages/<id>/…) or page ID appears, or when specs, designs, "
+        "runbooks, or decisions are likely documented in the wiki. Read pages "
+        "with get_confluence_page (body, attachments, comments); use "
+        "get_confluence_page_context to walk the page tree; search with "
+        "search_confluence (plain words or CQL). Pages reference Jira issues "
+        "as [Jira issue: KEY] — fetch those with get_issue. Fetch images "
+        "shown in a page with get_confluence_attachment.\n"
+        "\n"
+        "Call whoami only to debug authentication.\n"
+        "\n"
+        "Constraints: strictly read-only; nothing can be created, edited, "
+        "commented on, or transitioned."
     ),
 )
 
-# One client per process, created on first use. Lazy so that importing this
-# module (e.g. in tests) needs no credentials.
+# One client per product per process, created on first use. Lazy so that
+# importing this module (e.g. in tests) needs no credentials.
 _client: JiraClient | None = None
+_confluence_client: ConfluenceClient | None = None
 
 
 def _get_client() -> JiraClient:
@@ -73,24 +93,18 @@ def _get_client() -> JiraClient:
     return _client
 
 
+def _get_confluence_client() -> ConfluenceClient:
+    global _confluence_client
+    if _confluence_client is None:
+        _confluence_client = ConfluenceClient(load_settings())
+    return _confluence_client
+
+
 # *all so custom fields (acceptance criteria etc.) come along; comment and
 # worklog are excluded because comments are fetched separately with ordering.
 ISSUE_FIELDS = "*all,-comment,-worklog"
 CONTEXT_FIELDS = "summary,status,issuetype,parent,subtasks,issuelinks"
 SEARCH_FIELDS = ["summary", "status", "issuetype", "priority", "assignee", "updated"]
-
-MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024
-
-# The only mime types Claude can analyse visually, mapped to the format name
-# FastMCP's Image helper expects. Besides these, only text files are served;
-# known binaries (videos, PDFs, archives) are rejected before download.
-IMAGE_FORMATS = {
-    "image/png": "png",
-    "image/jpeg": "jpeg",
-    "image/jpg": "jpeg",
-    "image/gif": "gif",
-    "image/webp": "webp",
-}
 
 # Text up to this size is returned inline (well under Claude Code's ~25k token
 # MCP output limit). Longer text is saved in full to ATTACHMENT_CACHE_DIR and
@@ -133,7 +147,7 @@ async def _get_field_names(client: JiraClient) -> dict[str, str]:
     if _field_names is None:
         try:
             catalog = await client.get_json("/rest/api/3/field")
-        except JiraError as exc:
+        except AtlassianError as exc:
             logger.warning(
                 "Field catalog unavailable; custom fields will show raw IDs: %s", exc
             )
@@ -184,7 +198,15 @@ async def _get_issue_context_impl(client: JiraClient, issue_key: str) -> str:
         )
         epic_children = list(result.get("issues") or [])
 
-    return render_context(issue, epic_children)
+    context = render_context(issue, epic_children)
+    # Remote links (Confluence pages, PRs, ...) are a bonus: never fail on them.
+    try:
+        links = await client.get_json(f"/rest/api/3/issue/{key}/remotelink")
+    except AtlassianError as exc:
+        logger.warning("Remote links unavailable for %s: %s", key, exc)
+        return context
+    remote = [link for link in links or [] if isinstance(link, dict)]
+    return f"{context}\n\n{render_remote_links(remote)}"
 
 
 async def _search_issues_impl(client: JiraClient, jql: str, limit: int) -> str:
@@ -357,6 +379,19 @@ async def _whoami_impl(client: JiraClient) -> str:
     return render_myself(account, client.base_url or "?", client.used_cloud_id_fallback)
 
 
+async def _account_section(client: AtlassianClient) -> str:
+    """One product's auth report; an error becomes the section's content."""
+    name = client.product.name
+    try:
+        account = await client.get_json(client.product.probe_path)
+    except AtlassianError as exc:
+        return f"## {name}\n\n**Not connected:** {exc}"
+    report = render_myself(
+        account, client.base_url or "?", client.used_cloud_id_fallback
+    )
+    return f"## {name}\n\n{report}"
+
+
 # -- MCP tools ------------------------------------------------------------------
 # Docstrings are the API the model sees; they describe behaviour, not code.
 
@@ -383,7 +418,7 @@ async def get_issue(issue_key: str, include_comments: bool = True) -> str:
     """
     try:
         return await _get_issue_impl(_get_client(), issue_key, include_comments)
-    except (JiraError, ConfigError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -408,7 +443,7 @@ async def get_comments(
         key = normalize_issue_key(issue_key)
         comments = await _fetch_comments(client, key, limit, newest_first)
         return render_comments(comments)
-    except (JiraError, ConfigError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -430,7 +465,7 @@ async def get_issue_context(issue_key: str) -> str:
     """
     try:
         return await _get_issue_context_impl(_get_client(), issue_key)
-    except (JiraError, ConfigError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -449,7 +484,7 @@ async def search_issues(jql: str, limit: int = 25) -> str:
     """
     try:
         return await _search_issues_impl(_get_client(), jql, limit)
-    except (JiraError, ConfigError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -477,7 +512,113 @@ async def get_attachment(attachment_id: str | int) -> Image | str:
     """
     try:
         return await _get_attachment_impl(_get_client(), attachment_id)
-    except (JiraError, ConfigError, ValueError) as exc:
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_confluence_page(page: str | int, include_comments: bool = True) -> str:
+    """Get a Confluence page or blog post as Markdown.
+
+    Returns title, space, version, author/owner, last edit, labels, URL, the
+    full body (tables, macros, task lists, embedded images labelled with
+    their attachment IDs), the attachment list (fetch images via
+    get_confluence_attachment), and (by default) all footer and inline
+    comments with their reply threads. Jira issues embedded in the page
+    appear as [Jira issue: KEY]; read them with get_issue.
+
+    Args:
+        page: A numeric page ID ("123456") or a Confluence URL, e.g.
+            "https://site.atlassian.net/wiki/spaces/ENG/pages/123456/Title".
+            Blog post URLs work too.
+        include_comments: Set False to omit comments when only the page body
+            is needed — the response is much shorter.
+    """
+    try:
+        return await confluence.get_page_impl(
+            _get_confluence_client(), page, include_comments
+        )
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_confluence_comments(page: str | int, limit: int = 100) -> str:
+    """Get only the comments on a Confluence page or blog post, as Markdown.
+
+    Footer comments come first, then inline comments (each quoting the page
+    text it was attached to, and marked if resolved). Replies are nested
+    under their parent. Use this instead of get_confluence_page when the
+    body is already known and only the discussion is needed.
+
+    Args:
+        page: A numeric page ID or a Confluence page URL.
+        limit: Maximum number of top-level comments per kind (1-100).
+    """
+    try:
+        return await confluence.get_comments_impl(_get_confluence_client(), page, limit)
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_confluence_page_context(page: str | int) -> str:
+    """Map where a Confluence page sits in its space's page tree.
+
+    Returns the space, the ancestor chain (top-level first) and the direct
+    children (pages, folders, whiteboards, ...), each with title and ID so
+    the next page to read can be chosen without further calls.
+
+    Args:
+        page: A numeric page ID or a Confluence page URL.
+
+    Use this to find parent overviews or sibling specs; then
+    get_confluence_page on the IDs that look relevant.
+    """
+    try:
+        return await confluence.get_page_context_impl(_get_confluence_client(), page)
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def search_confluence(query: str, limit: int = 25) -> str:
+    """Search Confluence; returns a compact Markdown list with excerpts.
+
+    Plain words (e.g. "payment retry design") run a full-text search over
+    pages and blog posts. Anything containing CQL syntax is sent as CQL
+    as-is, e.g. 'space = ENG AND title ~ "onboarding" ORDER BY
+    lastmodified DESC' or 'type = page AND label = "adr"'. Each result has
+    title, type, space, page ID, last update and an excerpt.
+
+    Args:
+        query: Search words or a CQL query.
+        limit: Maximum number of results (1-100).
+    """
+    try:
+        return await confluence.search_impl(_get_confluence_client(), query, limit)
+    except (AtlassianError, ConfigError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@mcp.tool
+async def get_confluence_attachment(attachment_id: str | int) -> Image:
+    """Download an image attached to a Confluence page, for visual analysis.
+
+    Returns the image itself so it can be looked at directly — e.g. an
+    architecture diagram, mockup, or screenshot embedded in a spec. Only
+    images are supported (png, jpeg, gif, webp) up to 5 MB.
+
+    Args:
+        attachment_id: The attachment ID as listed by get_confluence_page,
+            e.g. get_confluence_attachment(attachment_id="att123456").
+            NOT the page ID and NOT the filename.
+    """
+    try:
+        return await confluence.get_attachment_impl(
+            _get_confluence_client(), attachment_id
+        )
+    except (AtlassianError, ConfigError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
 
 
@@ -485,21 +626,26 @@ async def get_attachment(attachment_id: str | int) -> Image | str:
 async def whoami() -> str:
     """Report which Atlassian account this server is authenticated as.
 
-    Returns display name, email, account ID, and which base URL was selected
-    (site URL vs cloud-ID fallback). Call this first when any other tool
-    returns authentication or permission errors — it isolates whether the
-    problem is the credentials or the specific resource.
+    Covers Jira and Confluence separately (they may use different tokens):
+    display name, email, account ID, and which base URL was selected (site
+    URL vs cloud-ID fallback). Call this first when any other tool returns
+    authentication or permission errors — it isolates whether the problem
+    is the credentials or the specific resource.
     """
     try:
-        return await _whoami_impl(_get_client())
-    except (JiraError, ConfigError) as exc:
+        sections = await asyncio.gather(
+            _account_section(_get_client()),
+            _account_section(_get_confluence_client()),
+        )
+    except ConfigError as exc:
         raise ToolError(str(exc)) from exc
+    return "\n\n".join(sections)
 
 
 # -- --check mode ----------------------------------------------------------------
 
 
-async def _run_check(issue_key: str | None) -> int:
+async def _run_check(issue_key: str | None, page: str | None) -> int:
     """Diagnostic mode for terminals and the PyCharm debugger.
 
     Runs entirely outside MCP, so printing to stdout is safe here.
@@ -512,22 +658,31 @@ async def _run_check(issue_key: str | None) -> int:
         return 1
     print(f"Site URL: {settings.site_url}")
     print(f"Cloud ID override: {settings.cloud_id or '(not set — auto-detect)'}")
+    separate_token = "yes" if settings.confluence_api_token else "no (shared token)"
+    print(f"Separate Confluence token: {separate_token}")
 
-    client = JiraClient(settings)
+    jira = JiraClient(settings)
+    wiki = ConfluenceClient(settings)
     try:
-        print(await _whoami_impl(client))
-        print(f"Cloud-ID fallback used: {client.used_cloud_id_fallback}")
+        print(f"\n{await _account_section(jira)}")
+        print(f"\n{await _account_section(wiki)}")
         if issue_key:
             print(f"\n--- {issue_key} ---\n")
-            print(await _get_issue_impl(client, issue_key, include_comments=True))
+            print(await _get_issue_impl(jira, issue_key, include_comments=True))
             print("\n--- context ---\n")
-            print(await _get_issue_context_impl(client, issue_key))
-    except (JiraError, ValueError) as exc:
+            print(await _get_issue_context_impl(jira, issue_key))
+        if page:
+            print(f"\n--- Confluence {page} ---\n")
+            print(await confluence.get_page_impl(wiki, page, include_comments=True))
+            print("\n--- page context ---\n")
+            print(await confluence.get_page_context_impl(wiki, page))
+    except (AtlassianError, ValueError) as exc:
         print(f"ERROR: {exc}")
         return 1
     finally:
-        await client.aclose()
-    print("\nAll checks passed.")
+        await jira.aclose()
+        await wiki.aclose()
+    print("\nAll requested checks ran (see sections above for per-product status).")
     return 0
 
 
@@ -539,7 +694,10 @@ def main() -> None:
     )
     parser = argparse.ArgumentParser(
         prog="jira_mcp",
-        description="Read-only Jira MCP server (stdio). Use --check to diagnose outside MCP.",
+        description=(
+            "Read-only Jira & Confluence MCP server (stdio). "
+            "Use --check to diagnose outside MCP."
+        ),
     )
     parser.add_argument(
         "--check",
@@ -549,12 +707,18 @@ def main() -> None:
         metavar="ISSUE_KEY",
         help="Run connectivity diagnostics and exit; optionally fetch ISSUE_KEY in full.",
     )
+    parser.add_argument(
+        "--page",
+        default=None,
+        metavar="PAGE",
+        help="With --check: also fetch this Confluence page ID or URL in full.",
+    )
     args = parser.parse_args()
 
-    if args.check is not None:
+    if args.check is not None or args.page:
         # asyncio.run() creates an event loop, runs one coroutine, and cleans
         # up — the standard way to call async code from a sync entry point.
-        sys.exit(asyncio.run(_run_check(args.check or None)))
+        sys.exit(asyncio.run(_run_check(args.check or None, args.page)))
 
     mcp.run()  # stdio transport is FastMCP's default
 

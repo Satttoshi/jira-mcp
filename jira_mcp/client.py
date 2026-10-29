@@ -1,17 +1,18 @@
-"""Read-only Jira HTTP client.
+"""Read-only Atlassian HTTP clients (Jira and Confluence).
 
 Two invariants live here:
 
 1. **Read-only enforcement.** Every request funnels through ``_request``,
-   which permits only GET — plus the single explicit exception
-   ``POST /rest/api/3/search/jql`` (a read that Atlassian requires as POST).
-   Any other method/path combination raises ``ReadOnlyViolationError``, so a
-   future edit that adds a write call fails loudly instead of quietly working.
+   which permits only GET — plus the product's explicit POST allowlist
+   (for Jira: ``POST /rest/api/3/search/jql``, a read that Atlassian
+   requires as POST; for Confluence: nothing). Any other method/path
+   combination raises ``ReadOnlyViolationError``, so a future edit that adds
+   a write call fails loudly instead of quietly working.
 
 2. **Base URL auto-detection.** Unscoped API tokens work against
    ``https://<site>.atlassian.net``; scoped tokens fail *silently* there
    (anonymous-looking responses) and must use
-   ``https://api.atlassian.com/ex/jira/{cloudId}``. We probe at startup,
+   ``https://api.atlassian.com/ex/<product>/{cloudId}``. We probe at startup,
    fall back via ``{site}/_edge/tenant_info``, cache the winner for the
    process lifetime, and log the decision to stderr.
 """
@@ -19,6 +20,7 @@ Two invariants live here:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -28,33 +30,73 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 MYSELF_PATH = "/rest/api/3/myself"
-
-# The complete set of non-GET requests this client will ever make.
-ALLOWED_POST_PATHS = frozenset({"/rest/api/3/search/jql"})
+CONFLUENCE_CURRENT_USER_PATH = "/wiki/rest/api/user/current"
 
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
+@dataclass(frozen=True)
+class Product:
+    name: str
+    # Path segment on the gateway: api.atlassian.com/ex/<gateway>/{cloudId}.
+    gateway: str
+    # Must return the authenticated account (with accountId) when auth works.
+    probe_path: str
+    token_env: str
+    scopes: str
+    not_found_hint: str
+    allowed_post_paths: frozenset[str] = frozenset()
+
+
+JIRA = Product(
+    name="Jira",
+    gateway="jira",
+    probe_path=MYSELF_PATH,
+    token_env="ATLASSIAN_API_TOKEN",
+    scopes="read:jira-work and read:jira-user",
+    not_found_hint="Jira reports issues you cannot view as 404",
+    allowed_post_paths=frozenset({"/rest/api/3/search/jql"}),
+)
+
+CONFLUENCE = Product(
+    name="Confluence",
+    gateway="confluence",
+    probe_path=CONFLUENCE_CURRENT_USER_PATH,
+    token_env="CONFLUENCE_API_TOKEN (or ATLASSIAN_API_TOKEN)",
+    scopes="the Confluence read scopes listed in the README",
+    not_found_hint="Confluence reports pages you cannot view as 404",
+)
+
+
 class ReadOnlyViolationError(RuntimeError):
-    """A code path attempted a request that could modify Jira."""
+    """A code path attempted a request that could modify Jira or Confluence."""
 
 
-class JiraError(Exception):
+class AtlassianError(Exception):
     """An API call failed; the message is written to be actionable."""
 
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
-class BaseUrlDetectionError(JiraError):
+
+class BaseUrlDetectionError(AtlassianError):
     """Neither candidate base URL authenticated successfully."""
 
 
-class JiraClient:
+class AtlassianClient:
     def __init__(
-        self, settings: Settings, http: httpx.AsyncClient | None = None
+        self,
+        settings: Settings,
+        product: Product,
+        api_token: str,
+        http: httpx.AsyncClient | None = None,
     ) -> None:
         self._settings = settings
+        self.product = product
         # Basic auth (email:token); the token itself is never logged.
         self._http = http or httpx.AsyncClient(
-            auth=(settings.email, settings.api_token),
+            auth=(settings.email, api_token),
             timeout=DEFAULT_TIMEOUT,
             headers={"Accept": "application/json"},
             follow_redirects=True,
@@ -71,6 +113,10 @@ class JiraClient:
     def base_url(self) -> str | None:
         return self._base_url
 
+    @property
+    def site_url(self) -> str:
+        return self._settings.site_url
+
     # -- public request helpers ------------------------------------------------
 
     async def get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
@@ -81,16 +127,12 @@ class JiraClient:
         """Download binary content (e.g. attachment bytes).
 
         Returns (content, mime type). The Accept header must be widened per
-        request: the client default of application/json would make Jira
+        request: the client default of application/json would make the API
         refuse to serve the raw file.
         """
         response = await self._request("GET", path, headers={"Accept": "*/*"})
         content_type = response.headers.get("content-type", "")
         return response.content, content_type.split(";")[0].strip()
-
-    async def search_jql(self, body: dict[str, Any]) -> Any:
-        response = await self._request("POST", "/rest/api/3/search/jql", json_body=body)
-        return response.json()
 
     # -- the single funnel -----------------------------------------------------
 
@@ -103,10 +145,11 @@ class JiraClient:
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         method = method.upper()
-        if method != "GET" and not (method == "POST" and path in ALLOWED_POST_PATHS):
+        allowed_posts = self.product.allowed_post_paths
+        if method != "GET" and not (method == "POST" and path in allowed_posts):
             raise ReadOnlyViolationError(
                 f"Blocked {method} {path}: this server is strictly read-only. "
-                f"Only GET requests are permitted, plus POST to {sorted(ALLOWED_POST_PATHS)}."
+                f"Only GET requests are permitted, plus POST to {sorted(allowed_posts)}."
             )
         base = await self._ensure_base_url()
         response = await self._http.request(
@@ -117,20 +160,27 @@ class JiraClient:
 
     # -- base URL detection ----------------------------------------------------
 
+    def _gateway_base(self, cloud_id: str) -> str:
+        return f"https://api.atlassian.com/ex/{self.product.gateway}/{cloud_id}"
+
     async def _ensure_base_url(self) -> str:
         if self._base_url is not None:
             return self._base_url
 
+        name = self.product.name
         if self._settings.cloud_id:
-            base = f"https://api.atlassian.com/ex/jira/{self._settings.cloud_id}"
+            base = self._gateway_base(self._settings.cloud_id)
             account = await self._probe(base)
             if account is None:
                 raise BaseUrlDetectionError(
-                    f"ATLASSIAN_CLOUD_ID is set, but authentication against {base} failed. "
-                    "Check the cloud ID, ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN."
+                    f"ATLASSIAN_CLOUD_ID is set, but {name} authentication against "
+                    f"{base} failed. Check the cloud ID, ATLASSIAN_EMAIL and "
+                    f"{self.product.token_env}."
                 )
             logger.info(
-                "Base URL: %s (ATLASSIAN_CLOUD_ID override, no detection)", base
+                "%s base URL: %s (ATLASSIAN_CLOUD_ID override, no detection)",
+                name,
+                base,
             )
             return self._select(base, account, fallback=False)
 
@@ -138,25 +188,29 @@ class JiraClient:
         account = await self._probe(site)
         if account is not None:
             logger.info(
-                "Base URL: %s (site URL authenticated directly — unscoped token)", site
+                "%s base URL: %s (site URL authenticated directly — unscoped token)",
+                name,
+                site,
             )
             return self._select(site, account, fallback=False)
 
         logger.info(
-            "Site URL %s did not authenticate (typical for scoped tokens); "
+            "%s: site URL %s did not authenticate (typical for scoped tokens); "
             "fetching cloud ID from _edge/tenant_info",
+            name,
             site,
         )
         cloud_id = await self._fetch_cloud_id(site)
-        base = f"https://api.atlassian.com/ex/jira/{cloud_id}"
+        base = self._gateway_base(cloud_id)
         account = await self._probe(base)
         if account is None:
             raise BaseUrlDetectionError(
-                f"Authentication failed against both {site} and {base}. "
-                "Check ATLASSIAN_EMAIL and ATLASSIAN_API_TOKEN. If the token was recently "
-                "created, confirm it has the read:jira-work and read:jira-user scopes."
+                f"{name} authentication failed against both {site} and {base}. "
+                f"Check ATLASSIAN_EMAIL and {self.product.token_env}. If the token "
+                f"is scoped, confirm it was created for {name} with "
+                f"{self.product.scopes}."
             )
-        logger.info("Base URL: %s (cloud-ID fallback — scoped token)", base)
+        logger.info("%s base URL: %s (cloud-ID fallback — scoped token)", name, base)
         return self._select(base, account, fallback=True)
 
     def _select(self, base: str, account: dict[str, Any], fallback: bool) -> str:
@@ -164,21 +218,24 @@ class JiraClient:
         self.account = account
         self.used_cloud_id_fallback = fallback
         logger.info(
-            "Authenticated as %s (%s)",
+            "%s: authenticated as %s (%s)",
+            self.product.name,
             account.get("displayName", "?"),
-            account.get("emailAddress", account.get("accountId", "?")),
+            account.get("emailAddress")
+            or account.get("email")
+            or account.get("accountId", "?"),
         )
         return base
 
     async def _probe(self, base: str) -> dict[str, Any] | None:
-        """GET /myself against a candidate base URL.
+        """GET the product's current-user endpoint against a candidate base URL.
 
         Returns the account JSON only for a real authenticated account: a
         scoped token hitting the wrong base can produce 200 responses that
         merely *look* anonymous, so a 200 without an accountId is a failure.
         """
         try:
-            response = await self._http.get(f"{base}{MYSELF_PATH}")
+            response = await self._http.get(f"{base}{self.product.probe_path}")
         except httpx.HTTPError as exc:
             logger.info("Probe of %s failed: %s", base, exc)
             return None
@@ -224,26 +281,45 @@ class JiraClient:
         status = response.status_code
         if status < 400:
             return
+        name = self.product.name
         if status == 401:
-            raise JiraError(
-                "401 Unauthorized: Jira rejected the credentials. Check ATLASSIAN_EMAIL "
-                "and ATLASSIAN_API_TOKEN (tokens expire and can be revoked)."
+            message = (
+                f"401 Unauthorized: {name} rejected the credentials. Check "
+                f"ATLASSIAN_EMAIL and {self.product.token_env} (tokens expire and "
+                "can be revoked)."
             )
-        if status == 403:
-            raise JiraError(
-                "403 Forbidden: the token or account lacks access. If this is a scoped "
-                "token, confirm it has the read:jira-work and read:jira-user scopes."
+        elif status == 403:
+            message = (
+                "403 Forbidden: the token or account lacks access. If this is a "
+                f"scoped token, confirm it has {self.product.scopes}."
             )
-        if status == 404:
-            raise JiraError(
-                f"404 Not Found for {path}: the resource does not exist — or your account "
-                "lacks permission to see it. Jira reports issues you cannot view as 404, "
-                "and an API token never grants more access than the account it belongs to."
+        elif status == 404:
+            message = (
+                f"404 Not Found for {path}: the resource does not exist — or your "
+                f"account lacks permission to see it. {self.product.not_found_hint}, "
+                "and an API token never grants more access than the account it "
+                "belongs to."
             )
-        if status == 429:
-            raise JiraError(
-                "429 Too Many Requests: Jira is rate-limiting; retry shortly."
-            )
-        raise JiraError(
-            f"Jira returned HTTP {status} for {path}: {response.text[:300]}"
-        )
+        elif status == 429:
+            message = f"429 Too Many Requests: {name} is rate-limiting; retry shortly."
+        else:
+            message = f"{name} returned HTTP {status} for {path}: {response.text[:300]}"
+        raise AtlassianError(message, status_code=status)
+
+
+class JiraClient(AtlassianClient):
+    def __init__(
+        self, settings: Settings, http: httpx.AsyncClient | None = None
+    ) -> None:
+        super().__init__(settings, JIRA, settings.api_token, http)
+
+    async def search_jql(self, body: dict[str, Any]) -> Any:
+        response = await self._request("POST", "/rest/api/3/search/jql", json_body=body)
+        return response.json()
+
+
+class ConfluenceClient(AtlassianClient):
+    def __init__(
+        self, settings: Settings, http: httpx.AsyncClient | None = None
+    ) -> None:
+        super().__init__(settings, CONFLUENCE, settings.confluence_token, http)
